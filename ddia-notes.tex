@@ -1,8 +1,12 @@
 \documentclass[12pt, titlepage]{article}
 
 \usepackage{amsmath}
+\usepackage{array}
 \usepackage{changepage}
+\usepackage{float}
 \usepackage{titling}
+
+\newcolumntype{C}[1]{>{\centering\let\newline\\\arraybackslash\hspace{0pt}}m{#1}}
 
 \title{Notes on \textit{Designing Data-Intensive Applications} by Martin Kleppmann}
 \setlength{\droptitle}{-20ex}
@@ -444,6 +448,390 @@ Some specialized data models:
 
 \section{Storage and Retrieval}
 
+\subsection{Data Structures That Power Your Database}
+
+A simple key-value store can be implemented with these Bash functions:
+
+\begin{verbatim}
+#!/bin/bash
+
+db_set () {
+    echo "$1,$2" >> database
+}
+
+db_get () {
+    grep "^$1," database | sed -e "s/^$1,//" | tail -n 1
+}
+\end{verbatim}
+
+Data would be stored in an append-only file (a \textit{log}), and outdated key-value pairs would remain in the file. \texttt{db\_set} has good performance because appending is efficient. \texttt{db\_get} has bad performance because it performs a linear search for every lookup. It could be improved with an \textit{index}. \\
+
+An \textit{index} is an additional structure that holds metadata derived from the primary data in the database. It helps you locate data but it needs to be updated when the database changes. \textbf{Well-chosen indexes speed up read queries, but every index slows down writes.} \\
+
+\subsubsection{Hash Indexes}
+
+A \textit{hash index} is an index implemented with a hash map. You could maintain an in-memory hash map that maps keys to byte offsets. When searching for the value associated with a key, the hash map will tell you how far into the file (on disk) the key-value pair is located. All of the keys must fit within the available memory. An append-only storage engine with a hash index would be appropriate for a system with many writes per key. \\
+
+Only appending means that the database will be full of outdated entries. How do we fix this inefficient use of disk space?
+
+\begin{itemize}
+    \item Split the log into \textit{segments} of a certain size; when the current segment is full, write to a new segment file.
+    \item Perform \textit{compaction} on the segments (delete outdated key-value pairs).
+    \item Merge smaller compacted segments together.
+\end{itemize}
+
+Segments cannot be modified after being written; compaction/merging must create a new file. The compaction/merging process can be done in a background thread. Meanwhile, reads and writes can be served with the old segment files. \\
+
+Each segment will have its own in-memory hash map. To find the value associated with a key, search the segments for the key in order from most recent to least recent. \\
+
+Other concerns:
+
+\begin{itemize}
+    \item Logs should not be in CSV format, they should be binary, storing the byte-length of a string, followed by the string
+    \item To delete a key, you must append a special deletion record (a \textit{tombstone}) to the log. Values for the deleted key that come before this tombstone will be deleted during compaction.
+    \item If the server crashes, the in-memory hash maps will be lost. Consider storing snapshots of the maps on disk.
+    \item The database may crash while appending a record. Consider including checksums in the log to determine whether a record is corrupted and should be ignored.
+    \item Concurrency: one write thread (writes are strictly sequential), multiple read threads (segments are append-only and immutable)
+\end{itemize}
+
+Append-only writing has advantages over overwriting. Appending is a sequential write operation, which is much faster than a random write operation, especially on HDDs. Because values cannot be overwritten, there is no chance that a file will be half-overwritten after a crash. \\
+
+Hash indexes do not facilitate efficient \textit{range queries} (reading all records with values within some range).
+
+\subsubsection{SSTables and LSM-Trees}
+
+What if the key-value pairs in the segments were sorted by key? This is called \textit{SSTable} or \textit{Sorted String Table} format. SSTable segments have many advantages over log-structured segments with hash indexes:
+
+\begin{enumerate}
+    \item Merging is efficient. Look at the first key in each segment, copy the lowest key to the output file, repeat. The merged segment is sorted by key. (A given key can only appear once in each segment, but multiple segments can contain the same key. If the same keys are being compared, copy the value from the newer segment and discard the value from the older segment.)
+    \item You don't need to keep an index for every key. You can just keep indexes for some keys (maybe one every few kilobytes) and scan between two adjacent indexes when searching for a key that would fall between them in the sorted order.
+    \item Key-value pairs that fall between indexes can be grouped into a block and compressed before being written to disk.
+\end{enumerate}
+
+How can the segments be sorted when writes are append-only and can come in any order? By adding new records to a self-balancing binary search tree (such as a red-black tree or AVL tree) in memory (insert in any order, read in sorted order). This in-memory tree is called the \textit{memtable}. \\
+
+When the memtable gets bigger than some threshold, write it to disk as an SSTable file (reading the memtable in sorted order is O(n)). While the memtable is being written to disk, new writes can be sent to a new memtable. \\
+
+To serve a read request, search the memtable first, then the most recent on-disk segment, then the segment before that, \dots \\
+
+If the server crashes, the memtable will be lost. To handle this, keep a separate log on disk to which every write is appended. It will contain the same records as the memtable but not in sorted order. It can be sorted later, if a crash happens. Once the memtable is written to disk, this log can be deleted. \\
+
+This indexing structure is known as a \textit{log-structured merge tree} (LSM-tree). Storage engines based on the idea of compacting and merging sorted files are called LSM storage engines. \\
+
+If a key is not in the database, searching for it will take a long time. Storage engines optimize this operation by using \textit{Bloom filters}, data structures for approximating the contents of a set. \\
+
+There are different ways to determine the order and timing of how SSTables are compacted and merged. In \textit{size-tiered compaction}, newer and smaller SSTables are successively merged into older and larger SSTables. In \textit{leveled compaction}, the key range is split up into smaller SSTables and older data is moved into separate ``levels," which allows the compaction to proceed more incrementally and use less disk space. \\
+
+LSM-trees can efficiently perform range queries, and they support high write throughput because they write data sequentially.
+
+\subsubsection{B-Trees}
+
+Like SSTables, B-trees keep key-value pairs sorted by key (efficient lookup and range queries). They have been around since 1970, and they are very popular. \\
+
+B-trees break the database down into fixed-size \textit{blocks} or \textit{pages}, traditionally 4 KB in size (sometimes bigger), and read or write one page at a time. \\
+
+A page can be identified with a reference (address on disk). A page contains (alternating) keys and references to other pages. \\
+
+For example, when looking for the value associated with key \texttt{251} in the following page:
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|c|c|c|c|c|}
+        \hline
+        \texttt{100} & \texttt{ref1} & \texttt{200} & \texttt{ref2} & \texttt{300} \\
+        \hline
+    \end{tabular}
+\end{table}
+
+You would follow \texttt{ref2} to the page that contains all keys greater than or equal to \texttt{200} and less than or equal to \texttt{300}. \\
+
+Eventually, you will get to a \textit{leaf page}, which either contains (alternating) keys and their values or (alternating) keys and references to the pages where the values can be found. \\
+
+The number of page references in a page is known as the \textit{branching factor}. It depends on the space required to store references and range boundaries but is typically several hundred.
+
+\begin{itemize}
+    \item \textit{To update a value for a key}: search for leaf page containing key, change value in page, write page back to disk.
+    \item \textit{To add a new key}: search for page whose range encompasses key, add key. If not enough space in page, split page into two half-full pages, update parent page with references to two new pages.
+\end{itemize}
+
+The tree will remain balanced. Most databases can fit into a B-tree with three or four levels (a four-level tree of 4 KB pages with branching factor of 500 can store up to 256 TB). \\
+
+Unlike the LSM-tree, the B-tree actually modifies files in-place. When a page is split, it requires three pages to be overwritten. If the database crashes during this operation, an orphan page may be created. To prevent this, B-tree implementations often have an additional data structure on disk called a \textit{write-ahead log} (WAL) or \textit{redo log}, where B-tree modifications are appended before they are applied to the pages of the tree itself. \\
+
+Updating pages in-place $\implies$ concurrency control measures are required (e.g. \textit{latches}). \\
+
+B-Tree Optimizations:
+
+\begin{itemize}
+    \item Instead of overwriting pages and maintaining a WAL, you could write a modified page to a new location and overwrite the parent page to point to the modified page.
+    \item Abbreviate keys (e.g. \texttt{1024} and \texttt{1048} could be stored as \texttt{24} and \texttt{48}). More keys in a page $\implies$ higher branching factor $\implies$ fewer levels.
+    \item Many B-tree implementations try to keep the leaf pages in sequential order to support fast range queries. This becomes difficult as the tree grows. LSM-trees are better at this.
+    \item Add additional pointers, like giving leaf pages left and right pointers to sibling leaf pages.
+\end{itemize}
+
+\subsubsection{Comparing B-Trees and LSM-Trees}
+
+As a rule of thumb, LSM-trees are faster for writes and B-trees are faster for reads. However, in practice, benchmarks are inconclusive, and you should measure the performance of both under your actual workload. \\
+
+A B-tree index must write each piece of data at least twice, to the WAL and the page. And the entire page has to be written, even if only a few bytes changed. A log-structured index also rewrites data multiple times, during compaction and merging. \\
+
+One write resulting in multiple writes to disk is called \textit{write amplification}. In write-heavy applications, this can be a bottleneck on write throughput. LSM-trees can typically sustain higher write throughput than B-trees (lower write amplification, sequentially writing compact SSTables vs/. overwriting several pages). \\
+
+LSM-trees can be compressed better. B-trees leave some disk space unused due to fragmentation. \\
+
+The compaction process of log-structured storage can sometimes interfere with incoming reads and writes (they have to wait for it to finish). \\
+
+A log-structured storage engine must share write throughput between initial writes and compaction writes. As the database grows, more of the disk bandwidth is needed for compaction. If compaction cannot keep up with writes (high write throughput, poor configuration), the number of unmerged segments will grow until disk space runs out. Reads will also slow down because segments are not compacted. \\
+
+In a B-tree, each key exists in exactly one place in the index. Transactional isolation is often implemented using locks on ranges of keys, and these locks can be directly attached to a B-tree.
+
+\subsubsection{Other Indexing Structures}
+
+A \textit{primary index} is an index where each key uniquely identifies a row in a relational table, a document in a document store, or a vertex in a graph. A \textit{secondary index} is an index where keys are not necessarily unique. In a relational database, you can create secondary indexes with the \texttt{CREATE INDEX} command, and they are often crucial for performing joins efficiently. \\
+
+LSM-trees and B-trees are used to implement key-value indexes, but secondary indexes output multiple values. We can implement a secondary index with a key-value index either by:
+
+\begin{enumerate}
+    \item making each value a list of row identifiers, or
+    \item making each key unique by appending a row identifier to it.
+\end{enumerate}
+
+Values in an index are usually references to primary data (rows). In this case, the rows themselves are stored in an unordered \textit{heap file}, and the values refer to some location in the heap file. This avoids duplicating data when multiple secondary indexes are present. \\
+
+A row in a heap file can be overwritten in-place if the new value is not larger than the old value. If it is, the row needs to written somewhere else in the heap, so either all indexes need to be updated or a forwarding pointer must be left behind at the old location. \\
+
+If the hop from index to heap file impacts reads too much, you can store the rows directly in the index as its values (as originals or copies). This is known as a \textit{clustered index}. Or if you want to store only some of the table's columns in the index, you can do so with a \textit{covering index} or \textit{index with included columns} (some queries can be answered with the index alone, the index \textit{covers} these queries). \\
+
+\textbf{Multi-column indexes} \medskip
+
+What if you need to query multiple columns of a table simultaneously (i.e. input two keys)? You could do this with an LSM-tree or B-tree by simply concatinating the values of multiple columns to form keys. This is the most common type of multi-column index---a \textit{concatenated index}. However, in such an index with keys of the form \texttt{(lastname, firstname)}, queries by \textit{lastname} will be efficient, but queries by \textit{firstname} will not. \\
+
+For efficient multi-column range queries, \textit{multi-dimensional indexes} are a better choice. They can do queries like this efficiently:
+
+\begin{verbatim}
+SELECT * FROM restaurants WHERE latitude  > 51.4946 AND latitude  < 51.5079
+                            AND longitude > -0.1162 AND longitude < -0.1004;
+\end{verbatim}
+
+Such indexes are usually implemented with \textit{R-trees}. You could also use a \textit{UB-tree}, which is a data structure that uses a space-filling curve to transform multivariate keys into univariate keys and then indexes those univariate keys in a B-tree. Multi-dimensional indexes are not necessarily spatial. They could be used to search for products with a color that falls within a constrained space in the RGB color domain. \\
+
+\textbf{Full-text search and fuzzy indexes} \medskip
+
+What if you need to query based on a given key and on keys that are similar to the given key? This is called \textit{fuzzy querying}, and it is often used in full-text search. Given an initial word, it can be used to find synonyms, grammatical variations, words nearby in the text, or words of a certain \textit{edit distance} away. \\
+
+\textbf{Keeping everything in memory} \medskip
+
+Indexes are answers to the limitations of disks (and SSDs). Physical storage location on these media affects their read/write performance. What if we instead store everything in RAM, where physical storage location does not affect read/write performance? \\
+
+HDDs and SSDs are non-volatile and cheaper than RAM. However, RAM is getting cheaper and its data can be made more durable by means of battery power, logging changes on disk, writting snapshots to disk, or replication of state to other machines. \\
+
+\textit{In-memory databases} are faster because they do not need to encode in-memory data structures in a form that can be stored on disk. \\
+
+An in-memory database can support datasets that are larger than the available memory. It can do this with \textit{anti-caching}, which is the process of evicting the least recently used data from memory to disk when memory is full and loading it back into memory when it is accessed again. However, any in-memory indexes must fit entirely within memory. \\
+
+Implementations: VoltDB, MemSQL, Oracle TimesTen, RAMCloud, Redis, Couchbase
+
+\subsection{Transaction Processing or Analytics?}
+
+In the early days of businesses using databases, a write typically corresponded to a commercial transaction taking place. Later, writes were used to represent many different things---postings comments, performing actions in a game, etc. The term \textit{transaction} came to be used to describe any group of reads and writes that forms a logical unit. \\
+
+Databases are typically used for either \textit{online transaction processing} (OLTP) or \textit{online analytics processing} (OLAP), where \textit{online} roughly means \textit{interactive}. OLTP is used for serving user requests, OLAP is used for supporting business intelligence. \\
+
+OLTP typically reads a small number of records per query, by giving a key to an index. It supports low-latency reads and writes. Its data represents the current state of a system. \\
+
+OLAP typically scans over a large number of records per query, reads only a few columns per record, and calculates aggregate statistics (e.g. count, sum, average). It writes data in bulk or in a continuous stream of updates. It often makes use of \textit{batch processing} (latency can be high). Its data represents a history of events.
+
+\subsubsection{Data Warehousing}
+
+OLTP systems need to be highly available and low-latency. Running expensive analytics queries on them can harm the performance of concurrently executing transactions. Thus, there was a trend in the 1990s for companies to copy data from their OLTP databases over to a \textit{data warehouse}, where analysts could perform their queries without impacting transactional performance. To do this, data is \textit{extracted} (periodically or continuously), \textit{transformed} into an analysis-friendly format, and \textit{loaded} into the warehouse via a process called \textit{ETL}. \\
+
+Data warehousing is more important for large companies. But a big advantage to using a separate data warehouse for analytics is that you can optimize its storage engine for analytic access patterns. \\
+
+Implementations:
+\begin{itemize}
+    \item \textit{Commercial data warehouses}: Teradata, Vertica, Microsoft SQL Server, SAP HANA, Amazon RedShift (ParAccel)
+    \item \textit{Open-source SQL-on-Hadoop}: Apache Hive, Spark SQL, Impala, Tajo, Drill; Facebook Presto
+\end{itemize}
+
+\subsubsection{Stars and Snowflakes: Schemas for Analytics}
+
+There is less data model diversity for analytics than there is for transaction processing. Many data warehouses use a \textit{star schema} (\textit{dimensional modeling}). \\
+
+In a star schema, there is a single, central \textit{fact table} that is surrounded by \textit{dimension tables}. Each row of the fact table represents an event (such as a customer's purchase of a product). Columns in the fact table can either be \textit{attributes} (values, such as the price at which the product was sold) or \textit{dimensions} (foreign key references to dimension tables, such as a reference to a record in a product table). \\
+
+One variation of this template is the \textit{snowflake schema}, where dimensions can be further broken down into subdimensions. For example, a fact table could have a product dimension, and that product dimension table could have a brand dimension or a category dimension.
+
+\subsection{Column-Oriented Storage}
+
+Fact tables can sometimes have trillions of rows. They often have over 100 columns, but typical analytics queries access only a few columns at a time. \\
+
+In most OLTP databases, storage is \textit{row-oriented}: all the values from one row of a table are stored next to each other. Document databases are similar: a document is stored as a contiguous sequence of bytes. \\
+
+It is inefficient to do an analytics query on row-oriented storage. You would have to scan through over 100 attributes per row, the majority of which would not be used. Once the rows are in memory, you would have to parse them and filter out the ones that don't match the query criteria. \\
+
+It is more efficient to do an analytics query on \textit{column-oriented} storage. Store the values from each column together on disk. Only read the columns that are used in the query. \\
+
+Each column file contains its data in the order of the rows (e.g. to get the 23rd row, read the 23rd value from each column file). \\
+
+Column-oriented storage can also be used for non-relational data. For example, Parquet is a columnar storage format that supports documents.
+
+\subsubsection{Column Compression}
+
+Repetitive sequences of column values can be compressed to lower demands on disk throughput. One way to do this is to encode column values as bitmaps to create a \textit{bitmap index} and then compress the bitmaps using \textit{run-length encoding}. One bitmap is created for each distinct value. \\
+
+Bitmap indexes work well for low-cardinality columns, which have a small number of distinct values relative to the total number of records. As cardinality increases, the number of bitmaps increases, the bitmaps become sparse, and run-length encoding becomes more effective. \\
+
+Column values: \\[-7mm]
+\begin{table}[H]
+    \centering
+    \begin{tabular}{C{5mm}|*{15}{C{4.2mm}|}}
+        \cline{2-16}
+        \textbf{V} & 69 & 69 & 74 & 31 & 31 & 31 & 29 & 30 & 30 & 31 & 31 & 31 & 68 & 69 & 69 \\
+        \cline{2-16}
+    \end{tabular}
+\end{table}
+
+Bitmap for each value: \\[-7mm]
+\begin{table}[H]
+    \centering
+    \begin{tabular}{C{5mm}|*{15}{C{4.2mm}|}}
+        \cline{2-16}
+        \textbf{29} & 0 & 0 & 0 & 0 & 0 & 0 & \textbf{1} & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+        \cline{2-16}
+        \textbf{30} & 0 & 0 & 0 & 0 & 0 & 0 & 0 & \textbf{1} & \textbf{1} & 0 & 0 & 0 & 0 & 0 & 0 \\
+        \cline{2-16}
+        \textbf{3\textbf{1}} & 0 & 0 & 0 & \textbf{1} & \textbf{1} & \textbf{1} & 0 & 0 & 0 & \textbf{1} & \textbf{1} & \textbf{1} & 0 & 0 & 0 \\
+        \cline{2-16}
+        \textbf{68} & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & \textbf{1} & 0 & 0 \\
+        \cline{2-16}
+        \textbf{69} & \textbf{1} & \textbf{1} & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & \textbf{1} & \textbf{1} \\
+        \cline{2-16}
+        \textbf{74} & 0 & 0 & \textbf{1} & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+        \cline{2-16}
+    \end{tabular}
+\end{table}
+
+Run-length encoding: \\[-7mm]
+\begin{table}[H]
+    \begin{tabular}{p{1cm}p{2cm}p{8cm}}
+        \textbf{29:} & 6, 1 & (6 zeros, 1 one, rest zeros) \\
+        \textbf{30:} & 7, 2 & (7 zeros, 2 ones, rest zeros) \\
+        \textbf{31:} & 3, 3, 3, 3 & (3 zeros, 3 ones, 3 zeros, 3 ones, rest zeros) \\
+        \textbf{68:} & 12, 1 & (12 zeros, 1 one, rest zeros) \\
+        \textbf{69:} & 13, 2 & (13 zeros, 2 ones) \\
+        \textbf{74:} & 2, 1 & (2 zeros, 1 one, rest zeros)
+    \end{tabular}
+\end{table}
+
+Bitmap indexes can perform bitwise logical operations within and across columns, which is very helpful for analytics workloads.
+
+\begin{itemize}
+    \item \texttt{WHERE product\_sk IN (30, 68, 69):} (bitwise \textit{OR})
+    \item \texttt{WHERE product\_sk = 31 and store\_sk = 3:} (bitwise \textit{AND})
+\end{itemize}
+
+For data warehouse queries, both disk-to-memory bandwidth and memory-to-CPU bandwidth are bottlenecks. Compressed column-oriented storage layouts help with both. Because the data is compressed, more rows from a column can fit into the CPU's L1 cache. Because rows do not need to be parsed for relevant data, the CPU can iterate over them in a tight loop. Bitwise logical operators can operate on the compressed data directly via \textit{vectorized processing}.
+
+\subsubsection{Sort Order in Column Storage}
+
+Column data can be stored simply by order of insertion, or we can impose some other order upon it (as we did with SSTables for row data). \\
+
+During sorting, elements in all of the column files must be rearranged in exactly the same way, to preserve row structure. Thus, rows can be sorted according to one column's sorted order. For example, transactions could be sorted by date. This would improve queries over date ranges. \\
+
+A second column can determine the sort order of any rows that have the same value in the first column. For example, transactions on the same date can be sorted by product name. This would improve queries that group or filter transactions by product name within a certain date range. You can define a third sort column, a fourth sort column, and so on\dots \\
+
+ If the primary sort column has low cardinality, then it will have long sequences of repeated values that can be compressed with run-length encoding. Compression works for second and third sort columns and so on, but its effectiveness decreases as you move down the sort priority. \\
+
+ Different queries benefit from different sort orders, so you could store the same data sorted in different ways to improve different kinds of queries. And because you need to replicate your data across multiple machines for redundancy anyway, you might as well sort the replicas in different ways.
+
+\subsubsection{Writing to Column-Oriented Storage}
+
+Update-in-place writing (what B-trees do) is not viable for compressed columns because all of the column files would have to be rewritten. LSM-trees can be used to write to column storage. Queries must take into account both the data stored on disk and the recently written data in the LSM-tree in memory.
+
+\subsubsection{Aggregation: Data Cubes and Materialized Views}
+
+Analytics queries often use aggregate functions in SQL (e.g. \texttt{COUNT}, \texttt{SUM}, \texttt{AVG}, \texttt{MIN}, \texttt{MAX}). It makes sense to cache the \textit{materialized aggregates} that are used most often by queries. \\
+
+A \textit{view} in a relational database is a table-like object that stores an underlying query that is executed dynamically when a user reads from the view. \\
+
+A \textit{materialized view} is a table-like object that stores an actual copy of its query results. Materialized views need to be updated when the underlying data changes, which is why they are mainly used in OLAP, not OLTP, systems. \\
+
+A \textit{data cube} is a type of materialized view. It is a grid of materialized aggregates grouped by different dimensions. \\
+
+Consider a fact table where each fact has foreign key references to two dimensions (e.g. \textit{date} and \textit{product}). You can draw a two-dimensional table with dates on axis and products on the other axis. Each cell contains an aggregate (e.g. \texttt{SUM}) of an attribute (e.g. \texttt{net\_price}) for all facts with that date-product combination. You can apply the same aggregate along each row or column to get summary reduced by one dimension (e.g. sales on this date, regardless of product).
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{C{1cm}|*{6}{C{1.6cm}|}}
+        \cline{2-7}
+          & 32 & 33 & 34 & 35 & \dots & total \\ \hline
+        \multicolumn{1}{|c|}{140101} & 149.60 & 31.01 & 84.58 & 28.18 & \textrightarrow & 40710.53 \\ \hline
+        \multicolumn{1}{|c|}{140102} & 132.18 & 19.78 & 82.91 & 10.96 & \textrightarrow & 73091.28 \\ \hline
+        \multicolumn{1}{|c|}{140103} & 196.75 & 0.00 & 12.52 & 64.67 & \textrightarrow & 54688.10 \\ \hline
+        \multicolumn{1}{|c|}{140104} & 178.36 & 9.98 & 88.75 & 56.16 & \textrightarrow & 95121.09 \\ \hline
+        \multicolumn{1}{|c|}{\dots} & \textdownarrow & \textdownarrow & \textdownarrow & \textdownarrow & \dots & \textdownarrow \\ \hline
+        \multicolumn{1}{|c|}{total} & 14967.09 & 5910.43 & 7328.85 & 6885.39 & \textrightarrow & lots \\ \hline
+    \end{tabular}
+\end{table}
+
+Facts can have more than two dimensions. Data cubes can be n-dimensional. \\
+
+Materialized data cubes can make certain queries very fast because the answers are precomputed, but querying a data cube is not as flexible as querying the database itself.
+
+\subsection{Summary}
+
+Disk seek time is often the bottleneck for OLTP systems. Disk bandwidth is often the bottleneck for OLAP systems. \\
+
+The key idea of log-structured storage engines: they turn random-access writes into sequential writes, which enables higher write throughput on HDDs (no seeking required) and SSDs. \\
+
+In OLAP, queries sequentially scan across a large number of rows, so indexes are not very helpful. It's more helpful to minimize the amount of data that the query needs to read from disk.
+
+\section{Encoding and Evolution}
+
+
+
+\subsection{Formats for Encoding Data}
+
+
+
+\subsubsection{Language-Specific Formats}
+
+
+
+\subsubsection{JSON, XML, and Binary Variants}
+
+
+
+\subsubsection{Thrift and Protocol Buffers}
+
+
+
+\subsubsection{Avro}
+
+
+
+\subsubsection{The Merits of Schemas}
+
+
+
+\subsection{Modes of Dataflow}
+
+
+
+\subsubsection{Dataflow Through Databases}
+
+
+
+\subsubsection{Dataflow Through Services: REST and RPC}
+
+
+
+\subsubsection{Message-Passing Dataflow}
+
+
+
+\subsection{Summary}
+
 
 
 \newpage
@@ -451,7 +839,21 @@ Some specialized data models:
 
 \section{Big Ideas}
 
+Well-chosen indexes speed up read queries, but every index slows down writes.
 
+\section{Glossary}
+
+\textit{Database index}: \\
+
+An index is a tool that is used for locating information or resources. You give it information about what you're looking for, it gives you information on where you can find what you're looking for. \\
+
+From the perspective of a database user: An index is a database object that improves the speed of data retrieval at the cost of additional writes and storage space. It is a map whose values are primary data in the database. \\
+
+From the perspective of a storage engine developer: An index is a data structure auxiliary to the primary database that contains metadata derived from the primary data. It is a map whose values are references to locations on disk where primary data is stored. (In the case of a \textit{clustered index}, the values are the primary data themselves.) \\
+
+In publishing, an index is a collection of words or phrases (\textit{headings}) and associated \textit{pointers} (such as page numbers, which are a form of locational metadata) to useful information related to the headers. \\
+
+\textit{Foreign key}: a column in a table that refers to a primary key in some other table.
 
 \end{document}
 
