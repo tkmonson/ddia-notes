@@ -788,31 +788,93 @@ In OLAP, queries sequentially scan across a large number of rows, so indexes are
 
 \section{Encoding and Evolution}
 
+A change in an application's features generally requires a change in the data it stores. Changes usually need to be made gradually. \\
 
+For server-side applications, a \textit{rolling upgrade} or \textit{staged rollout} deploys new code to a few nodes at a time. For client-side applications, users may update their software at different times. In both cases, old and new versions of the code and data may coexist in the system. We need compatibility in both directions. \\
+
+\textit{Backward compatibility}: newer code can read data written by older code \\
+\textit{Forward compatibility}: older code can read data written by newer code
 
 \subsection{Formats for Encoding Data}
 
-
+The translation of an in-memory structure to a byte sequence that can be stored on disk or sent over a network is called \textit{encoding} or \textit{serialization} or \textit{marshalling}. The reverse is called \textit{decoding} or \textit{deserialization} or \textit{unmarshalling}.
 
 \subsubsection{Language-Specific Formats}
 
-
+Language-specific encodings are typically a bad idea. They lock you into using the same language, introduce security problems through the decoding process (which needs to be able to instantiate arbitrary classes), and do not handle compatibility well.
 
 \subsubsection{JSON, XML, and Binary Variants}
 
+JSON, XML, and CSV are textual, human-readable formats. They are popular and, despite their problems, will likely continue to be used for data interchange between organizations that need to agree on a common format. \\
 
+Problems:
+\begin{itemize}
+    \item JSON and XML have optional schema support, CSV does not. If schemas are not used, then data will have to be interpreted (decoded) manually in the application code.
+    \item XML and CSV do not distinguish between numbers and digit strings. JSON does not distinguish between integers and floating-point numbers. Integers larger than $2^{53}$ cannot be exactly represented in an IEEE 754 double-precision floating-point number, so such numbers become inaccurate when parsed in an language that uses floating-point numbers (such as JavaScript).
+    \item JSON and XML do not support binary strings (sequences of bytes without a character encoding). One workaround is to encode binary data as text using Base64 and define the value as Base64-encoded in the schema (increases data size by 33\%.
+\end{itemize}
+
+Some binary encodings for JSON: MessagePack, BSON, BJSON, UBJSON, BISON, Smile. Some binary encodings for XML: WBXML, Fast Infoset. \\
+
+These binary encodings made specifically for JSON and XML do not prescribe a schema because JSON and XML do not require one. Thus, they need to include all the object field names in the encoded data. This means that they will not save much space compared to their textual counterparts. \\
 
 \subsubsection{Thrift and Protocol Buffers}
 
+Apache Thrift (developed at Facebook) and Protocol Buffers (protobuf, developed at Google) are binary encoding libraries that require a schema. This means that they do not have to encode the field names. Instead, they can encode \textit{field tags} (numerical aliases) that are defined in the schema. This saves space. \\
 
+Thrift and Protocol Buffers each come with a code generation tool that inputs a schema definition and outputs classes that implement the schema in various programming languages. Application code can call this generated code to encode and decode records of the schema. \\
+
+Thrift has multiple encoding formats, such as BinaryProtocol and CompactProtocol. CompactProtocol improves upon BinaryProtocol by packing the field type and tag into a single byte and by using variable-length integers. \\
+
+The \texttt{required} and \texttt{optional} keywords in the Thrift and Protocol Buffers IDLs do not affect data is encoded. The \texttt{required} keyword simply enables a runtime check that fails if the field is not set. \\
+
+Field names in a schema can be changed with no issue, as encoded data never refers to field names, only field tags. Changing a field tag would make all existing encoded data invalid. \\
+
+To maintain forward compatibility:
+\begin{itemize}
+    \item New fields that are added to a schema must have new field tags. Old code must be able to skip over fields with new tags that it does not recognize.
+    \item Tags from fields that have been removed can never be reused. New code must be able to skip these fields in old data.
+\end{itemize}
+
+To maintain backward compatibility:
+\begin{itemize}
+    \item New fields that are added to a schema cannot be required. New code must be able to read old data that does not have these fields. Thus, all fields added after initial deployment must be optional or have a default value.
+    \item Only optional fields can be removed. Old code must be able to read new data that does not have these fields.
+\end{itemize}
+
+Changing the datatype of a field in a schema may cause values to lose precision or be truncated. For example, if a 32-bit integer is updated to a 64-bit integer, new code will be able to fill in missing bits with zeros, but old code will not be able to correctly read any values that do not fit in 32 bits. \\
+
+In Protocol Buffers, an \texttt{optional} field (single-valued) can be changed into a \texttt{repeated} field (multi-valued). New code reading old data will see a list with zero or one elements. Old code reading new data will see only the last element of the list. Because Thrift has a dedicated list type, it does not support the same evolution from single- to multi-valued fields, but it does support nested lists.
 
 \subsubsection{Avro}
 
+Avro improves on Thrift and Protocol Buffers by getting rid of field tags and datatype bytes entirely. To parse the binary data, you go through the fields in the order that they appear in the schema to find the datatype of each field. Thus, binary data can only be properly decoded if the reader is using the exact same schema that the writer used to encode the data. \\
 
+If the \textit{writer's schema} and the \textit{reader's schema} differ, Avro resolves their differences. If fields are out of order, it matches them by field name. If a field appears in the writer's schema but not the reader's schema, it is ignored. If a field appears in the reader's schema but not the writer's schema, it is assigned the default value defined in the reader's schema. \\
+
+Unlike Thrift and Protocol Buffers, Avro does not have \texttt{optional} and \texttt{required} markers. Instead, it has union types and default values. To maintain backward and forward compatibility, you must only add or remove fields with default values. To specify that a field is nullable (optional), you must assign it a union type (e.g. \texttt{union \{ null, long \}}). \\
+
+To resolve schema differences, the reader needs to know the writer's schema. It would be too space-inefficient to send the schema along with every record, but it could reasonably be sent as part of processing many records. Some examples:
+
+\begin{itemize}
+    \item A large file containing many records encoded with the same schema (an \textit{object container file}) can include the schema once.
+    \item A database containing records encoded with different schemas at different times can store the different schema versions, mark the records with a schema version number, and fetch the correct schema when decoding.
+    \item When two processes are communicating over a bidirectional network connection, they can agree on a schema to use for the lifetime of the connection.
+\end{itemize}
+
+An Avro schema does not use tag numbers. That makes it a better choice for dynamically generated schemas as differences between schemas can be resolved by field name instead of by tag number. When a database schema changes, a new Avro schema can be generated from it without worrying about maintaining consistent tag numbers. \\
+
+Avro provides optional code generation for statically typed programming languages (create classes with a type that conforms to the Avro schema, put the decoded data into objects that can be manipulated in memory).
 
 \subsubsection{The Merits of Schemas}
 
-
+Binary encodings based on schemas:
+\begin{itemize}
+    \item Are compact (because they do not have to encode field names)
+    \item Are self-documenting (the schema describes the encoding and is required for decoding)
+    \item Help check for backward and forward compatibility of recent schema changes when previous schema versions are stored in a database
+    \item Can generate code from the schema in a statically typed programming language
+\end{itemize}
 
 \subsection{Modes of Dataflow}
 
@@ -820,22 +882,244 @@ In OLAP, queries sequentially scan across a large number of rows, so indexes are
 
 \subsubsection{Dataflow Through Databases}
 
+Consider this scenario:
+\begin{itemize}
+    \item a new writer \textit{p1} encodes an object and writes a record with a new field to a database
+    \item an old reader \textit{p2} decodes the record and reads the data into an in-memory object, ignoring the new field
+    \item \textit{p2} updates one of the object's values, encodes the object (without the new field), and writes the record to the database
+    \item the new field is lost
+\end{itemize}
+Conclusion: you may need to ensure that your application code does not break forward compatibility. \\
 
+Most relational databases allow simple schema changes, such as adding a column with a null default value, without rewriting existing data. Schema evolution like this allows an entire database to appear as if it was encoded with a single schema, even though the underlying storage may contain records encoded with various historical versions of the schema. \\
+
+Let's say you want to make a copy of an entire database for archival purposes or for analysis in a warehouse. You should consider:
+\begin{itemize}
+    \item Encoding the copy using a single schema (data could then be stored in an Avro object container file)
+    \item Encoding the copy in a column-oriented format like Parquet, if you intend to do analysis on it
+\end{itemize}
 
 \subsubsection{Dataflow Through Services: REST and RPC}
 
+Some examples of clients: web browsers, native applications, client-side JavaScript applications running inside of a web browser (\textit{Ajax}), servers making requests of other servers or databases. \\
 
+In a \textit{service-oriented architecture} (SOA) or \textit{microservices architecture}, each service is owned by one team, is independently deployable, and is used by other teams. Old and new versions of servers and clients may be running at the same time, so the data encoding used by servers and clients must be compatible across versions of the service API. \\
+
+When HTTP is used to talk to a service, it is called a \textit{web service}. But web services are not only used on the web. Some examples of web services:
+
+\begin{itemize}
+    \item A user application making requests to a service over HTTP.
+    \item A service making requests to another service owned by the same organization, often within the same datacenter.
+    \item A service making requests to a service owned by a different organization (data interchange).
+\end{itemize}
+
+There are many ways to make an API call over a network. All of them involve making a \textit{remote procedure call} (RPC), which is when a machine calls a function that is defined on a different machine (in a separate address space) in its network. \\
+
+There are two popular approaches to web services: \textit{REST} and \textit{SOAP}. REST is not a protocol, but a design philosophy that builds on the principles of HTTP. SOAP is an XML-based protocol for making network API requests. \\
+
+A SOAP API is described using Web Services Description Language (WSDL). A RESTful API can be described using OpenAPI (Swagger). \\
+
+The RPC model tries to make sending a request to a remote network service look the same as calling a local function (\textit{location transparency}). This is a flawed approach because they are fundamentally different. \\
+
+Ways that remote function calls are different than local function calls:
+\begin{itemize}
+    \item Unlike a local call, a remote call is unpredictable and may fail due to problems outside of your control.
+    \item A local call either returns a result, throws an exception, or never returns (infinite loop or crash). In addition to these outcomes, a remote call can also return without a result, due to \textit{timeout}.
+    \item If a remote call fails, it could be that the request got through but the response was lost. If you retry the remote call, you will cause the actions to be performed twice, unless you build a mechanism for deduplication (idempotence) into the protocol.
+    \item A remote call is much slower than a local call, and its latency is wildly variable.
+    \item The arguments of a remote call must be encoded into a sequence of bytes.
+    \item A remote service may be implemented in a different programming language than the client application making the call. In this case, the RPC framework must translate datatypes from one language to another. This can cause issues with numbers.
+\end{itemize}
+
+Thrift and Avro support RPC. gRPC is an RPC implementation that uses Protocol Buffers. \\
+
+A custom RPC protocol could have better performance than REST, but mostly only in the context of making intra-organizational requests (typically within the same datacenter). \\
+
+\textbf{For dataflow through services, it is reasonable to assume that all servers will be updated before any client is updated. Requests must be backward-compatible, responses must be forward-compatible.} \\
+
+The compatibility properties of an API depend on the encoding it uses:
+\begin{itemize}
+    \item RESTful APIs usually use JSON and URI-encoded request parameters. Adding optional request parameters and adding new response fields both maintain compatibility.
+    \item SOAP APIs use XML. Evolution is possible but tricky.
+    \item Thrift, gRPC, and Avro RPCs can be evolved according to the compatibility rules of their respective encodings.
+\end{itemize}
+
+If the provider of a service cannot force its clients to update, it will need to maintain compatibility indefinitely. If a compatibility-breaking change is needed, the provider will probably have to maintain multiple versions of the service (clients will select a version to use via URL, header, or selection data stored server-side).
 
 \subsubsection{Message-Passing Dataflow}
 
+In an \textit{asynchronous message-passing system}, a \textit{producer} sends a message to a \textit{message broker} or \textit{message queue} or \textit{topic}, which stores the message temporarily, and the broker sends the message to one or more \textit{consumers} or \textit{subscribers}. The topic is one-way; producers typically do not expect a response. \\
 
+Advantages of using a message broker compared to direct RPC:
+\begin{itemize}
+    \item Acts as a buffer if the recipient is currently unavailable
+    \item Can automatically redeliver messages
+    \item Abstracts away the IP address and port number of the recipient. Logically decouples sender from recipient.
+    \item One-to-many message distribution (multicast)
+\end{itemize}
+
+Topics can be chained together. A consumer can send a message back to a producer via a \textit{reply queue}. If an old consumer republishes messages, you may need to make sure that it does not erase fields added by a new producer. \\
+
+A message broker typically does not enfore a particular data model or encoding. \\
+
+The \textit{actor model} is a programming model for concurrency in a single process. Each actor represents one entity, it may have local (non-shared) state, and it communicates with other actors by sending and receiving asynchronous messages. Messages can be lost. Because actors process only one message at a time, they can be scheduled independently. \\
+
+In a \textit{distributed actor framework}, messages can be sent between actors on the same node or across different nodes. In the latter case, messages will be transparently encoded, sent over the network, and decoded on the other side. If you want to be able to perform a rolling upgrade for your actor-based application, you have to ensure backward and forward compatibility. \\
+
+Distributed actor frameworks: Akka, Orleans, Erlang OTP.
 
 \subsection{Summary}
 
+Assume we have a service that is replicated across multiple nodes. We would like to be able to perform rolling upgrades on this system because they allow new versions of a service to be released without downtime (encouraging frequent small releases over rare big releases) and make deployments less risky (faulty releases can be rolled back before they affect all users). To do this, we need to ensure all data flowing in the system is encoded in a way that provides backward and forward compatibility. \\
 
+Language-specific encodings are bad. Textual encodings are okay, but popular. Binary encodings are compact, efficient, and have clearly defined compatibility semantics.
 
 \newpage
 \appendix
+
+\section{Appendix for Chapter 4}
+
+Below are a number of binary encodings (byte sequences) of the following JSON record:
+
+\begin{verbatim}
+         {
+             "userName": "Martin",
+             "favoriteNumber": 1337,
+             "interests": ["daydreaming", "hacking"]
+         }
+\end{verbatim}
+
+Strings are encoded according to UTF-8.
+
+\subsection{MessagePack}
+
+66 bytes:
+
+\begin{itemize}
+    \item \texttt{83} (object, 3 entries)
+    \item \texttt{a8} (string, length 8)
+    \item \texttt{75 73 65 72 4e 61 6d 65} (\texttt{userName})
+    \item \texttt{a6} (string, length 6)
+    \item \texttt{4d 61 72 74 69 6e} (\texttt{Martin})
+    \item \texttt{ae} (string, length 14)
+    \item \texttt{66 61 76 6f 72 69 74 65 4e 75 6d 62 65 72} (\texttt{favoriteNumber})
+    \item \texttt{cd} (uint16)
+    \item \texttt{05 39} (\texttt{1337})
+    \item \texttt{a9} (string, length 9)
+    \item \texttt{69 6e 74 65 72 65 73 74 73} (\texttt{interests})
+    \item \texttt{92} (array, 2 entries)
+    \item \texttt{ab} (string, length 11)
+    \item \texttt{64 61 79 64 72 65 61 6d 69 6e 67} (\texttt{daydreaming})
+    \item \texttt{a7} (string, length 7)
+    \item \texttt{68 61 63 6b 69 6e 67} (\texttt{hacking})
+\end{itemize}
+
+\subsection{Thrift}
+
+A schema for the JSON record, written in the Thrift interface description language (IDL), would look like this:
+
+\begin{verbatim}
+         struct Person {
+             1: required string       userName,
+             2: optional i64          favoriteNumber,
+             3: optional list<string> interests
+         }
+\end{verbatim}
+
+\subsubsection{BinaryProtocol}
+
+59 bytes:
+
+\begin{itemize}
+    \item \texttt{0b} (type 11, string)
+    \item \texttt{00 01} (field tag = 1)
+    \item \texttt{00 00 00 06} (length 6)
+    \item \texttt{4d 61 72 74 69 6e} (\texttt{Martin})
+    \item \texttt{0a} (type 10, i64)
+    \item \texttt{00 02} (field tag = 2)
+    \item \texttt{00 00 00 00 00 00 05 39} (\texttt{1337})
+    \item \texttt{0f} (type 15, list)
+    \item \texttt{00 03} (field tag = 3)
+    \item \texttt{0b} (item type 11, string)
+    \item \texttt{00 00 00 02} (2 list items)
+    \item \texttt{00 00 00 0b} (length 11)
+    \item \texttt{64 61 79 64 72 65 61 6d 69 6e 67} (\texttt{daydreaming})
+    \item \texttt{00 00 00 07} (length 7)
+    \item \texttt{68 61 63 6b 69 6e 67} (\texttt{hacking})
+    \item \texttt{00} (end of struct)
+\end{itemize}
+
+\subsubsection{CompactProtocol}
+
+34 bytes:
+
+\begin{itemize}
+    \item \texttt{18} (field tag = 1; type 8, string)
+    \item \texttt{06} (length 6)
+    \item \texttt{4d 61 72 74 69 6e} (\texttt{Martin})
+    \item \texttt{16} (field tag += 1; type 6, i64)
+    \item \texttt{f2 14} (\texttt{1337}, see p.119 of original text for how)
+    \item \texttt{19} (field tag += 1; type 9, list)
+    \item \texttt{28} (2 list items; item type 8, string)
+    \item \texttt{0b} (length 11)
+    \item \texttt{64 61 79 64 72 65 61 6d 69 6e 67} (\texttt{daydreaming})
+    \item \texttt{07} (length 7)
+    \item \texttt{68 61 63 6b 69 6e 67} (\texttt{hacking})
+    \item \texttt{00} (end of struct)
+\end{itemize}
+
+\subsection{Protocol Buffers}
+
+A schema for the JSON record, written in the Protocol Buffers interface description language (IDL), would look like this:
+
+\begin{verbatim}
+         message Person {
+             required string user_name      = 1
+             optional int64 favorite_number = 2
+             repeated string interests      = 3
+         }
+\end{verbatim}
+
+33 bytes:
+
+\begin{itemize}
+    \item \texttt{0a} (field tag = 1; type 2, string \textrightarrow\ \texttt{00001 010})
+    \item \texttt{06} (length 6)
+    \item \texttt{4d 61 72 74 69 6e} (\texttt{Martin})
+    \item \texttt{10} (field tag = 2; type 0, varint \textrightarrow\ \texttt{00010 000})
+    \item \texttt{b9 0a} (\texttt{1337}, see p.120 of original text for how)
+    \item \texttt{1a} (field tag = 3; type 2, string \textrightarrow\ \texttt{00011 010})
+    \item \texttt{0b} (length 11)
+    \item \texttt{64 61 79 64 72 65 61 6d 69 6e 67} (\texttt{daydreaming})
+    \item \texttt{1a} (field tag = 3; type 2, string \textrightarrow\ \texttt{00011 010})
+    \item \texttt{07} (length 7)
+    \item \texttt{68 61 63 6b 69 6e 67} (\texttt{hacking})
+\end{itemize}
+
+\subsection{Avro}
+
+\begin{verbatim}
+         record Person {
+             string               userName;
+             union { null, long } favoriteNumber;
+             array<string>        interests;
+         }
+\end{verbatim}
+
+32 bytes:
+
+\begin{itemize}
+    \item \texttt{0c} (length 6)
+    \item \texttt{4d 61 72 74 69 6e} (\texttt{Martin})
+    \item \texttt{02} (union branch 1 \textrightarrow long)
+    \item \texttt{f2 14} (\texttt{1337}, see p.123 of original text for how)
+    \item \texttt{04} (2 array items)
+    \item \texttt{16} (length 11)
+    \item \texttt{64 61 79 64 72 65 61 6d 69 6e 67} (\texttt{daydreaming})
+    \item \texttt{0e} (length 7)
+    \item \texttt{68 61 63 6b 69 6e 67} (\texttt{hacking})
+    \item \texttt{00} (end of array)
+\end{itemize}
 
 \section{Big Ideas}
 
@@ -843,7 +1127,15 @@ Well-chosen indexes speed up read queries, but every index slows down writes.
 
 \section{Glossary}
 
-\textit{Database index}: \\
+\textbf{Application programming interface (API):} \\
+
+A key principle of design is to prohibit access to all resources by default. An \textit{interface} is a well-defined entry point, or a set thereof, that allows access to resources. An API is an interface that supports application programming. It is an interface between computer programs. \\
+
+\textit{API documentation} tells you how to use an API (information on endpoints, parameters, response formats, and authentication requirements). \\
+
+An API specification is a technical description of an API's behavior and the data models it uses. It is usually written in JSON or XML according to a standard (such as OpenAPI or Swagger). It tells you how to implement an API. \\
+
+\textbf{Database index:} \\
 
 An index is a tool that is used for locating information or resources. You give it information about what you're looking for, it gives you information on where you can find what you're looking for. \\
 
