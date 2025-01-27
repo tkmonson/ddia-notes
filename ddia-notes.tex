@@ -4,8 +4,10 @@
 \usepackage{array}
 \usepackage{changepage}
 \usepackage{float}
+\usepackage{textcomp}
 \usepackage{titling}
 
+\newcommand{\subsubsubsection}[1]{\small \textbf{#1} \medskip}
 \newcolumntype{C}[1]{>{\centering\let\newline\\\arraybackslash\hspace{0pt}}m{#1}}
 
 \title{Notes on \textit{Designing Data-Intensive Applications} by Martin Kleppmann}
@@ -602,7 +604,7 @@ A row in a heap file can be overwritten in-place if the new value is not larger 
 
 If the hop from index to heap file impacts reads too much, you can store the rows directly in the index as its values (as originals or copies). This is known as a \textit{clustered index}. Or if you want to store only some of the table's columns in the index, you can do so with a \textit{covering index} or \textit{index with included columns} (some queries can be answered with the index alone, the index \textit{covers} these queries). \\
 
-\textbf{Multi-column indexes} \medskip
+\subsubsubsection{Multi-column indexes}
 
 What if you need to query multiple columns of a table simultaneously (i.e. input two keys)? You could do this with an LSM-tree or B-tree by simply concatinating the values of multiple columns to form keys. This is the most common type of multi-column index---a \textit{concatenated index}. However, in such an index with keys of the form \texttt{(lastname, firstname)}, queries by \textit{lastname} will be efficient, but queries by \textit{firstname} will not. \\
 
@@ -615,11 +617,11 @@ SELECT * FROM restaurants WHERE latitude  > 51.4946 AND latitude  < 51.5079
 
 Such indexes are usually implemented with \textit{R-trees}. You could also use a \textit{UB-tree}, which is a data structure that uses a space-filling curve to transform multivariate keys into univariate keys and then indexes those univariate keys in a B-tree. Multi-dimensional indexes are not necessarily spatial. They could be used to search for products with a color that falls within a constrained space in the RGB color domain. \\
 
-\textbf{Full-text search and fuzzy indexes} \medskip
+\subsubsubsection{Full-text search and fuzzy indexes}
 
 What if you need to query based on a given key and on keys that are similar to the given key? This is called \textit{fuzzy querying}, and it is often used in full-text search. Given an initial word, it can be used to find synonyms, grammatical variations, words nearby in the text, or words of a certain \textit{edit distance} away. \\
 
-\textbf{Keeping everything in memory} \medskip
+\subsubsubsection{Keeping everything in memory}
 
 Indexes are answers to the limitations of disks (and SSDs). Physical storage location on these media affects their read/write performance. What if we instead store everything in RAM, where physical storage location does not affect read/write performance? \\
 
@@ -878,8 +880,6 @@ Binary encodings based on schemas:
 
 \subsection{Modes of Dataflow}
 
-
-
 \subsubsection{Dataflow Through Databases}
 
 Consider this scenario:
@@ -973,6 +973,227 @@ Distributed actor frameworks: Akka, Orleans, Erlang OTP.
 Assume we have a service that is replicated across multiple nodes. We would like to be able to perform rolling upgrades on this system because they allow new versions of a service to be released without downtime (encouraging frequent small releases over rare big releases) and make deployments less risky (faulty releases can be rolled back before they affect all users). To do this, we need to ensure all data flowing in the system is encoded in a way that provides backward and forward compatibility. \\
 
 Language-specific encodings are bad. Textual encodings are okay, but popular. Binary encodings are compact, efficient, and have clearly defined compatibility semantics.
+
+\section{Replication}
+
+\textit{Replication} means storing the same data on multiple machines that are connected via a network. You might want to do this for:
+
+\begin{itemize}
+	\item Geographic proximity (reduced latency)
+	\item Resiliency (increased availability)
+	\item Scale (increased read throughput)
+\end{itemize}
+
+The hard part of replication is handling changes to replicated data.
+
+\subsection{Leaders and Followers}
+
+Single-leader replication:
+
+\begin{enumerate}
+	\item One replica is the \textit{leader}. All writes are sent to the leader, which writes the data to its local storage.
+	\item All other replicas are \textit{followers}. When the leader writes to its storage, it also sends the changes to its followers as part of a \textit{replication log} or \textit{change stream}. Each follower applies the writes in the same order as on the leader.
+	\item Reads can go to any replica.
+\end{enumerate}
+
+\subsubsection{Synchronous Versus Asynchronous Replication}
+
+\textit{Synchronous replication}: the leader waits until a follower confirms that it received the write before reporting success to the client
+\begin{itemize}
+	\item Follower is guaranteed to have up-to-date, consistent data
+	\item If the follower does not respond, the write cannot be processed. The leader must block all writes until the follower is available.
+\end{itemize}
+
+\textit{Asynchronous replication}: the leader does not wait for a response from the follower
+\begin{itemize}
+    \item Leader can continue to process writes, even if all of its followers have fallen behind
+	\item If the leader fails, any writes that have not been replicated are lost
+	\item Writes are not durable, even though a client may have been told a write was successful
+	\item Very popular configuration
+\end{itemize}
+
+\textit{Semi-synchronous replication}: one follower is synchronous
+\begin{itemize}
+	\item Two nodes are guaranteed to have an up-to-date copy of the data
+	\item If the synchronous follower is slow, one of the asynchronous followers is made synchronous
+\end{itemize}
+
+\subsubsection{Setting Up New Followers}
+
+\begin{enumerate}
+	\item Take a consistent snapshot of the leader's database at some point in time (preferably without locking the database).
+	\item Copy the snapshot to the new follower node.
+	\item The follower connects to the leader and requests all changes since the snapshot was taken. The snapshot is associated with a position in the leader's replication log (\textit{log sequence number} or \textit{binlog coordinates}).
+	\item When the follower processes the backlog of changes, it has \textit{caught up}.
+\end{enumerate}
+
+\subsubsection{Handling Node Outages}
+
+If a follower crashes, it knows the last transaction that was processed before the crash. It can connect to the leader and request all changes that have occurred since that transaction. \\
+
+If the leader fails, one of the followers needs to become the leader. This is called \textit{failover}, and it usually involves the following steps:
+\begin{enumerate}
+	\item \textit{Determining that the leader has failed.} Nodes send heartbeat messages to each other. If the leader does not respond for some period of time, it is assumed to be dead.
+	\item \textit{Choosing a new leader.} Can be done in various ways, such as via election or \textit{controller node}. The best candidate is usually the most up-to-date follower (minimizes data loss). This is a consensus problem.
+	\item \textit{Reconfiguring the system to use the new leader.} Clients need to send their requests to the new leader. If the old leader come back, it needs to become a follower.
+\end{enumerate}
+
+Potential failover problems:
+\begin{itemize}
+	\item If asynchronous replication is used, the new leader might not have all the writes from the old leader. If the old leader come back, what should happen to those writes? The new leader may have received conflicting writes in the meantime. The most common solution is to discard the writes, which may violate the client's durability expectations.
+	\item Discarding writes can be dangerous if other storage systems need to be coordinated with the database contents. The writes could have been successfully written to a cache, for example. Now, the cache and database are inconsistent.
+	\item If two nodes believe they are the leader, you have a situation called \textit{split brain}. Data is likely to be lost or corrupted. Some systems are designed to detect this and shut down one of the nodes using an approach called \textit{fencing}, also known as \textit{Shoot The Other Node In The Head} (STONITH).
+	\item How long should the heartbeat timeout be? Longer \textrightarrow{} longer recovery times. Shorter \textrightarrow{} failover response is too sensitive, could unnecessarily take down an operational leader during a load spike.
+\end{itemize}
+
+There are no easy solutions to these problems. For this reason, some operations teams prefer to perform failovers manually.
+
+\subsubsection{Implementation of Replication Logs}
+
+\subsubsubsection{Statement-Based Replication}
+\begin{itemize}
+	\item Leader logs every write request (\textit{statement}) that it executes, sends log to followers.
+	\item If any statement calls a nondeterministic function (e.g. \texttt{NOW()}, \texttt{RAND()}) or a function with nondeterministic side effects, then changes will be different between the leader and the followers.
+	\item If statements use an autoincrementing column or depend on existing data in the database, they must be executed in exactly the same order as on the leader.
+	\item Generally only used for deterministic statements \\
+\end{itemize}
+
+\subsubsubsection{Write-Ahead Log (WAL) Shipping}
+\begin{itemize}
+	\item Storage engines (log-structured and B-tree) append writes to a log and store that log on disk. This log can be sent to followers.
+	\item The format of this log depends on the storage engine (describes which bytes were changed in which disk blocks). If the database changes its storage format from one version to another, it is typically not possible to run different versions of the database software on the leader and followers.
+	\item If all nodes must use the same database version, then you cannot perform a zero-downtime upgrade of the database software by upgrading the followers and then performing a failover. \\
+\end{itemize}
+
+\subsubsubsection{Logical (Row-Based) Log Replication}
+\begin{itemize}
+	\item A storage engine's log is a \textit{physical log}; it describes the physical data representation in the storage engine. Instead, we could use a \textit{logical log} for replication; each record would describe the change that occurs in a single row of the database.
+	\item A logical log is not coupled to storage engine internals, so nodes can run different versions of a storage engine (or different storage engines) without issue.
+	\item Logical logs are easier for external applications to parse (\textit{change data capture}). \\
+\end{itemize}
+
+\subsubsubsection{Trigger-Based Replication}
+\begin{itemize}
+	\item The above approaches implement replication at the database level. If you want to use application code to replicate between different kinds of databases or resolve conflicts, you could instead implement replication at the application level.
+	\item A \textit{trigger} in a database system executes custom application code when a write occurs. It logs the change in a table, and the table can be read by the process that executes the application code.
+	\item Greater overhead, more prone to bugs and limitations
+\end{itemize}
+
+\subsection{Problems with Replication Lag}
+
+It is common for a web application to serve many more reads than writes. Such an application would benefit from a \textit{read-scaling} architecture. A system with leader-based replication can scale reads easily by adding followers and distributing reads across them. In practice, such a system must use asynchronous replication. If the application reads from an asynchronous follower, it may see outdated information if the follower has fallen behind. For a period of time, the database is \textit{inconsistent}. \\
+
+Asynchronously replicated databases are \textit{eventually consistent}. \textit{Replication lag} is the delay between a write happening on the leader and being reflected on a follower. Problems occur with significant replication lag. \\
+
+While its underlying database may be only eventually consistent, an application can provide stronger guarantees of consistency by routing requests according to certain rules.
+
+\subsubsection{Reading Your Own Writes}
+
+If a user makes a post on a website, a write is sent to the leader. If the user tries to view the post they just made, a read is sent to a follower. If this follower has not replicated the write yet, then, to the user, it looks like the data they submitted was lost. \\
+
+To fix this, we want \textit{read-after-write consistency}, also known as \textit{read-your-writes consistency}, a guarantee that if a user reloads the page, they will always see any updates they submitted themselves. \\
+
+Techniques to do this:
+\begin{itemize}
+	\item When reading something the user may have edited, read it from the leader (e.g. user profile).
+	\item If most things are potentially editable by the user, then too much traffic will go to the leader. Instead, you could read from the leader for one minute since the time of the last update and prevent queries on followers more than one minute behind the leader.
+	\item Client stores timestamp of last write. Any follower serving reads for client must be updated at least until that timestamp. Otherwise, read can be handled by another follower or query can wait for follower to catch up. Timestamp can be logical (log sequence number) or clock-based (clock synchronization required).
+	\item If replicas are distributed across multiple datacenters, requests to be served by the leader must be routed to the datacenter that contains the leader.
+\end{itemize}
+
+If the same user is accessing the system from different devices, you may want to provide \textit{cross-device read-after-write consistency}. If you are storing timestamp of last write, that data needs to be centralized. If you are reading from the leader, requests from all user's devices must be routed to the same datacenter.
+
+\subsubsection{Monotonic Reads}
+
+If a user reads from a replica with little lag and then from a replica with greater lag, they may see the system moving backwards in time. For example, they may see a comment that was just posted and then see it disappear. \\
+
+\textit{Monotonic reads} is a guarantee that a user will not read older data after previously reading newer data. One way to achieve this is to make sure that each user makes their reads to the same replica. If that replica fails, the user's requests will have to be rerouted to another replica.
+
+\subsubsection{Consistent Prefix Reads}
+
+Some writes are causally related to each other, a question and its answer. If one replica is updated slower than another, an observer may see the answer before the question. This is often a problem for systems with distributed partitions; different partitions operate independently, so there is no global ordering of writes. \\
+
+\textit{Consistent prefix reads} is a guarantee that if a sequence of writes happens in a certain order, then anyone reading those writes will see them in the same order. One way to achieve this is to write causally dependent writes to the same partition, but this is not always feasible.
+
+\subsubsection{Solutions for Replication Lag}
+
+The above guarantees are implemented at the application level. It would be nice if application developers didn't have to worry about this stuff and could just trust the database to do the right thing. \textit{Transactions} provide a way for databases to provide stronger guarantees, at the cost of performance and availability.
+
+\subsection{Multi-Leader Replication}
+
+Single-leader replication has a single point of failure for writes. What if we allow more than one node to accept writes? In this case, each leader acts as a follower to the other leaders.
+
+\subsubsection{Use Cases for Multi-Leader Replication}
+
+\subsubsubsection{Multi-Datacenter Operation}
+
+Assume you have a database with replicas in several different datacenters (for fault-tolerance and/or geographic proximity). In a multi-leader configuration, you can have a leader in each datacenter, and each leader will replicate its changes to its followers within its datacenter and to the leaders in other datacenters. \\
+
+Multi-leader advantages:
+\begin{itemize}
+	\item Each write can be processed by the local datacenter, instead of traveling all the way to the one leader. Users may perceive improved performance.
+	\item If a datacenter fails, the other datacenters can continue to operate independently, without need for failover.
+	\item A network partition between datacenters will not prevent writes from being processed.
+\end{itemize}
+
+Multi-leader disadvantages:
+\begin{itemize}
+	\item The same data can be concurrently modified in different datacenter, which causes a write conflict that must be resolved.
+	\item Subtle configuration pitfalls and surprising interactions with other database features (autoincrementing keys, triggers, integrity constraints) that make multi-leader replication more trouble than it's worth.
+\end{itemize}
+
+\subsubsubsection{Clients With Offline Operation}
+
+What if you have an application that needs to work while disconnected from the internet, like a calendar app? If you are creating new meetings on your phone while disconnected, your phone has a local database that is acting as a leader, and there is an asynchronous multi-leader replication process (sync) occurring that will send changes to the replicas of your calendar when you connect to the internet again. \\
+
+CouchDB is designed for this mode of operation. \\
+
+\subsubsubsection{Collaborative Editing}
+
+When a user edits a document, the changes are written to their local replica and asynchronously replicated to the server and any other users reading the same document. To ensure no editing conflicts, you can put a lock on the document (single-leader replication with transactions on the leader). For faster collaboration, you can make the unit of change very small (e.g. a single keystroke) and avoid locking (multi-leader replication).
+
+\subsubsection{Handling Write Conflicts}
+
+If a user changes a title from A to B and another user changes the same title from A to C, each user's change will be applied to their local leader, but when the changes are asynchronously replicated, a conflict is detected. \\
+
+\subsubsubsection{Conflict Avoidance}
+
+If the application can ensure that all writes for a particular record go through the same leader, then conflicts cannot occur. However, if you need to switch to a different leader for that record, then write conflicts may occur. \\
+
+\subsubsubsection{Converging Toward a Consistent State}
+
+In multi-leader, there is no defined ordering of writes. If each replica simply applied writes in the order that it saw the writes, the database would end up in an inconsistent state. The database must resolve the conflict in a \textit{convergent} way. There are multiple possible approaches:
+
+\begin{itemize}
+	\item Give each write a unique ID. If a timestamp is used, this is called \textit{last write wins} (LWW). Popular and prone to data loss.
+	\item Give each replica a unique ID. Let writes that originated from higher-numbered replicas win. Also prone to data loss.
+	\item Somehow merge the values together (e.g. order alphabetically and concatenate, ``B/C")
+	\item Record the conflict in an explicit data structure and write application code that resolve the conflict later
+\end{itemize}
+
+\subsubsubsection{Custom Conflict Resolution Logic}
+
+Most multi-leader replication tools let you write conflict resolution logic using application code. This can be done on write (conflict handler is called and runs in the background as soon as a conflict is detected) or on read (conflicting writes are stored when a conflict is detected and they are all returned on the next read, to be resolved automatically or by prompting the user).
+
+\subsubsection{Multi-Leader Replication Topologies}
+
+A \textit{replication topology} describes the communication paths along which writes are propagated from one node to another. The most general topology is \textit{all-to-all}, in which every leader sends its writes to every other leader. There are also more restricted topologies like \textit{circular topology} and \textit{star topology}. \\
+
+In circular and star topology, if there is a partition between nodes, then changes cannot be replicated until the partition is fixed. All-to-all is more fault-tolerant because changes are allowed to travel along different paths. \\
+
+All-to-all is susceptible to causality problems because a dependent replication message could ``overtake" the message it depends on. For example, if a user creates a row in a table and another user edits that row, but the edit message is replicated to a node before the create message, that's a problem. \textit{Version vectors} can be used to solve this.
+
+\subsection{Leaderless Replication}
+
+\subsubsection{Writing to the Database When a Node Is Down}
+
+\subsubsection{Limitations of Quorum Consistency}
+
+\subsubsection{Sloppy Quorums and Hinted Handoff}
+
+\subsubsection{Detecting Concurrent Writes}
+
+\subsection{Summary}
 
 \newpage
 \appendix
