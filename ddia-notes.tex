@@ -974,6 +974,112 @@ Assume we have a service that is replicated across multiple nodes. We would like
 
 Language-specific encodings are bad. Textual encodings are okay, but popular. Binary encodings are compact, efficient, and have clearly defined compatibility semantics.
 
+\section{Replication}
+
+\textit{Replication} means storing the same data on multiple machines that are connected via a network. You might want to do this for:
+
+\begin{itemize}
+	\item Geographic proximity (reduced latency)
+	\item Resiliency (increased availability)
+	\item Scale (increased read throughput)
+\end{itemize}
+
+The hard part of replication is handling changes to replicated data.
+
+\subsection{Leaders and Followers}
+
+Single-leader replication:
+
+\begin{enumerate}
+	\item One replica is the \textit{leader}. All writes are sent to the leader, which writes the data to its local storage.
+	\item All other replicas are \textit{followers}. When the leader writes to its storage, it also sends the changes to its followers as part of a \textit{replication log} or \textit{change stream}. Each follower applies the writes in the same order as on the leader.
+	\item Reads can go to any replica.
+\end{enumerate}
+
+\subsubsection{Synchronous Versus Asynchronous Replication}
+
+\textit{Synchronous replication}: the leader waits until a follower confirms that it received the write before reporting success to the client
+\begin{itemize}
+	\item Follower is guaranteed to have up-to-date, consistent data
+	\item If the follower does not respond, the write cannot be processed. The leader must block all writes until the follower is available.
+\end{itemize}
+
+\textit{Asynchronous replication}: the leader does not wait for a response from the follower
+\begin{itemize}
+    \item Leader can continue to process writes, even if all of its followers have fallen behind
+	\item If the leader fails, any writes that have not been replicated are lost
+	\item Writes are not durable, even though a client may have been told a write was successful
+	\item Very popular configuration
+\end{itemize}
+
+\textit{Semi-synchronous replication}: one follower is synchronous
+\begin{itemize}
+	\item Two nodes are guaranteed to have an up-to-date copy of the data
+	\item If the synchronous follower is slow, one of the asynchronous followers is made synchronous
+\end{itemize}
+
+\subsubsection{Setting Up New Followers}
+
+\begin{enumerate}
+	\item Take a consistent snapshot of the leader's database at some point in time (preferably without locking the database).
+	\item Copy the snapshot to the new follower node.
+	\item The follower connects to the leader and requests all changes since the snapshot was taken. The snapshot is associated with a position in the leader's replication log (\textit{log sequence number} or \textit{binlog coordinates}).
+	\item When the follower processes the backlog of changes, it has \textit{caught up}.
+\end{enumerate}
+
+\subsubsection{Handling Node Outages}
+
+If a follower crashes, it knows the last transaction that was processed before the crash. It can connect to the leader and request all changes that have occurred since that transaction. \\
+
+If the leader fails, one of the followers needs to become the leader. This is called \textit{failover}, and it usually involves the following steps:
+\begin{enumerate}
+	\item \textit{Determining that the leader has failed.} Nodes send heartbeat messages to each other. If the leader does not respond for some period of time, it is assumed to be dead.
+	\item \textit{Choosing a new leader.} Can be done in various ways, such as via election or \textit{controller node}. The best candidate is usually the most up-to-date follower (minimizes data loss). This is a consensus problem.
+	\item \textit{Reconfiguring the system to use the new leader.} Clients need to send their requests to the new leader. If the old leader come back, it needs to become a follower.
+\end{enumerate}
+
+Potential failover problems:
+\begin{itemize}
+	\item If asynchronous replication is used, the new leader might not have all the writes from the old leader. If the old leader come back, what should happen to those writes? The new leader may have received conflicting writes in the meantime. The most common solution is to discard the writes, which may violate the client's durability expectations.
+	\item Discarding writes can be dangerous if other storage systems need to be coordinated with the database contents. The writes could have been successfully written to a cache, for example. Now, the cache and database are inconsistent.
+	\item Split brain
+	\item Timeouts
+\end{itemize}
+
+There are no easy solutions to these problems. For this reason, some operations teams prefer to perform failovers manually.
+
+\subsubsection{Implementation of Replication Logs}
+
+\subsection{Problems with Replication Lag}
+
+\subsubsection{Reading Your Own Writes}
+
+\subsubsection{Monotonic Reads}
+
+\subsubsection{Consistent Prefix Reads}
+
+\subsubsection{Solutions for Replication Lag}
+
+\subsection{Multi-Leader Replication}
+
+\subsubsection{Use Cases for Multi-Leader Replication}
+
+\subsubsection{Handling Write Conflicts}
+
+\subsubsection{Multi-Leader Replication Topologies}
+
+\subsection{Leaderless Replication}
+
+\subsubsection{Writing to the Database When a Node Is Down}
+
+\subsubsection{Limitations of Quorum Consistency}
+
+\subsubsection{Sloppy Quorums and Hinted Handoff}
+
+\subsubsection{Detecting Concurrent Writes}
+
+\subsection{Summary}
+
 \newpage
 \appendix
 
